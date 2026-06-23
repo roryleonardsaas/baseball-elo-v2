@@ -188,7 +188,6 @@ with st.sidebar:
     min_pa = st.slider("Min PA for leaderboard", 10, 1000, 100, 10)
     sort_by = st.radio("Sort leaderboard by", ["End ELO", "Avg ELO", "Peak ELO", "Worst ELO", "Range"],
                        help="End ELO: current rating. Peak ELO: hottest point. Worst ELO: lowest point. Avg ELO: sustained value. Range: Peak minus Worst (streakiness).")
-    st.caption("Iteration 1 — on-base vs out only")
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 _src = ("Retrosheet" if all(y < 2015 for y in selected_years)
@@ -495,7 +494,8 @@ def _rating_for(year: int, pid: int, role: str, metric: str) -> float:
     return ratings.get(pid, 1500.0)
 
 
-mp_metric = st.radio("Rating to use", ["Avg ELO", "End ELO", "Peak ELO"], horizontal=True, key="mp_metric")
+mp_metric = st.radio("Rating to use", ["Avg ELO", "End ELO", "Peak ELO"],
+                     horizontal=True, key="mp_metric")
 
 mc1, mc2, mc3 = st.columns(3)
 with mc1:
