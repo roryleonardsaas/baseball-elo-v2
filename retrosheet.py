@@ -15,9 +15,8 @@ MVP scope: outcomes, wOBA, on-base, inning. Running score (bat_score/fld_score) 
 now — a follow-up will add run tracking to power historical leverage/clutch analysis.
 """
 import os
-import io
 import zipfile
-import urllib.request
+import requests
 import pandas as pd
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
@@ -70,7 +69,17 @@ def _download_season(year: int) -> str:
     zip_path = os.path.join(RAW_DIR, f"{year}eve.zip")
     if not os.path.exists(zip_path):
         url = f"https://www.retrosheet.org/events/{year}eve.zip"
-        urllib.request.urlretrieve(url, zip_path)
+        # Use requests (certifi CA bundle) — the macOS python.org build lacks system
+        # root certs, so urllib's HTTPS verification fails.
+        resp = requests.get(url, timeout=60)
+        if resp.status_code == 404:
+            raise FileNotFoundError(
+                f"Retrosheet has no event file for {year} "
+                f"(coverage is complete from 1974, partial earlier)."
+            )
+        resp.raise_for_status()
+        with open(zip_path, "wb") as f:
+            f.write(resp.content)
     return zip_path
 
 
