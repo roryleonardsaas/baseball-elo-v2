@@ -5,6 +5,9 @@ from pybaseball import statcast, playerid_reverse_lookup
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# Statcast coverage begins 2015; earlier seasons route through Retrosheet.
+STATCAST_START = 2015
+
 ON_BASE_EVENTS = {
     "single", "double", "triple", "home_run",
     "walk", "hit_by_pitch", "catcher_interf",
@@ -78,12 +81,30 @@ def fetch_seasons(years: list[int]) -> tuple[pd.DataFrame, dict[int, str]]:
     With multiple years this powers 'career' mode: ELO carries across seasons
     because run_elo processes the combined frame in date order without resets.
     """
-    frames = [_load_season_pa(y) for y in sorted(years)]
+    import retrosheet
+
+    frames = []
+    names: dict[int, str] = {}
+    for y in sorted(years):
+        if y < STATCAST_START:
+            df_y, retro_names = retrosheet.parse_season(y)
+            names.update(retro_names)
+        else:
+            df_y = _load_season_pa(y)
+        frames.append(df_y)
+
     df = pd.concat(frames, ignore_index=True)
     if "season" not in df.columns:
         df["season"] = df["game_date"].dt.year
+    # game_pk is int (Statcast) or str game-id (Retrosheet); unify so sorting/dedup is safe
+    df["game_pk"] = df["game_pk"].astype(str)
     df = df.sort_values(["game_date", "game_pk", "at_bat_number"]).reset_index(drop=True)
-    names = _build_name_lookup(list(set(df["batter"].tolist()) | set(df["pitcher"].tolist())))
+
+    # Names: Retrosheet ids already resolved above; resolve remaining MLBAM (Statcast) ids
+    statcast_ids = [i for i in (set(df["batter"]) | set(df["pitcher"]))
+                    if i < retrosheet.RETRO_ID_BASE]
+    if statcast_ids:
+        names.update(_build_name_lookup(statcast_ids))
     return df, names
 
 

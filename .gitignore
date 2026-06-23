@@ -8,6 +8,9 @@ venv/
 # Regeneratable ELO computation caches (large; rebuilt on first run)
 cache/elo_*.pkl
 
+# Raw Retrosheet event-file downloads (re-downloaded; parsed parquets are kept)
+retrosheet_raw/
+
 # OS / editor
 .DS_Store
 .idea/

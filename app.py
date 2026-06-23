@@ -107,12 +107,17 @@ def season_index_corr(year: int, min_pa_corr: int):
 
 def available_cached_years() -> list[int]:
     ys = []
-    for f in glob.glob(os.path.join(os.path.dirname(__file__), "cache", "statcast_*.parquet")):
-        try:
-            ys.append(int(os.path.basename(f).split("_")[1].split(".")[0]))
-        except (IndexError, ValueError):
-            pass
-    return sorted(ys)
+    cache = os.path.join(os.path.dirname(__file__), "cache")
+    for pattern in ("statcast_*.parquet", "retro_2*.parquet"):
+        for f in glob.glob(os.path.join(cache, pattern)):
+            base = os.path.basename(f)
+            if base.startswith("retro_names"):
+                continue
+            try:
+                ys.append(int(base.split("_")[1].split(".")[0]))
+            except (IndexError, ValueError):
+                pass
+    return sorted(set(ys))
 
 
 @st.cache_data(show_spinner=False)
@@ -129,7 +134,8 @@ with st.sidebar:
     st.header("Settings")
     from datetime import date as _date
     current_year = _date.today().year
-    all_years = list(range(current_year, 2014, -1))
+    # 2015+ = Statcast; 1915–2014 = Retrosheet (complete from 1974, partial earlier)
+    all_years = list(range(current_year, 1914, -1))
 
     scope = st.radio(
         "Scope", ["Single Season", "Career"], index=0,
