@@ -27,6 +27,20 @@ def expected_woba(r_batter: float, r_pitcher: float, league_woba: float) -> floa
     return 2 * league_woba * p
 
 
+def elo_index(rating: float, league_woba: float, role: str) -> int:
+    """
+    Convert an ELO rating to a 100-scale index (like wRC+ / FIP-).
+    Batter: expected wOBA vs a league-average pitcher, indexed to 100 (higher=better).
+    Pitcher: expected wOBA allowed vs a league-average batter, indexed to 100
+    (lower=better, comparable to ERA-/FIP-).
+    """
+    if role == "batter":
+        ew = expected_woba(rating, DEFAULT_RATING, league_woba)
+    else:
+        ew = expected_woba(DEFAULT_RATING, rating, league_woba)
+    return round(100 * ew / league_woba)
+
+
 def compute_park_factors(df: pd.DataFrame, regression: float = 0.5, min_pa: int = 500) -> dict:
     """
     Per-(season, park) wOBA park factors via the home/road method.
@@ -245,7 +259,9 @@ def build_leaderboard(
     sort_by: str = "End ELO",
     team_filter: set | None = None,
     player_teams: dict[int, str] | None = None,
+    extra_columns: dict[str, dict[int, float]] | None = None,
 ) -> pd.DataFrame:
+    extra_columns = extra_columns or {}
     rows = []
     for pid, rating in ratings.items():
         if pa_counts.get(pid, 0) < min_pa:
@@ -253,7 +269,7 @@ def build_leaderboard(
         team = (player_teams or {}).get(pid, "")
         if team_filter and team not in team_filter:
             continue
-        rows.append({
+        row = {
             "Name": display_names.get(pid, f"ID:{pid}"),
             "Team": team,
             "End ELO": round(rating, 1),
@@ -262,7 +278,10 @@ def build_leaderboard(
             "Worst ELO": round(worst_ratings.get(pid, rating), 1),
             "Range": round(peak_ratings.get(pid, rating) - worst_ratings.get(pid, rating), 1),
             "PA": int(pa_counts.get(pid, 0)),
-        })
+        }
+        for col_name, col_vals in extra_columns.items():
+            row[col_name] = col_vals.get(pid)
+        rows.append(row)
     df = pd.DataFrame(rows)
     if df.empty:
         return df

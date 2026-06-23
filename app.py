@@ -1,3 +1,5 @@
+import os
+import glob
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5,7 +7,7 @@ import plotly.graph_objects as go
 from collections import Counter
 
 from data_fetch import fetch_seasons
-from elo import run_elo, build_leaderboard, expected_woba, compute_park_factors
+from elo import run_elo, build_leaderboard, expected_woba, compute_park_factors, elo_index
 
 st.set_page_config(page_title="Baseball ELO", layout="wide")
 st.title("Baseball ELO Ratings — Iteration 2: wOBA + Park Factors")
@@ -20,6 +22,97 @@ def cached_fetch(years: tuple[int, ...]):
 def cached_elo(years: tuple[int, ...], league_woba: float):
     df, _ = cached_fetch(years)
     return run_elo(df, league_woba=league_woba, years=years)
+
+
+@st.cache_data(show_spinner=False)
+def cached_actual_indices(years: tuple[int, ...]):
+    """
+    Each player's actual park-adjusted seasonal wOBA, indexed to 100.
+    Batters: wOBA+ (higher=better). Pitchers: wOBA-against- (lower=better).
+    A homemade wRC+ / FIP- analog built on the same wOBA the ELO uses.
+    """
+    df_y, _ = cached_fetch(years)
+    lw = float(df_y["woba_value"].mean())
+    pf = compute_park_factors(df_y)
+    keys = list(zip(df_y["season"].astype(int), df_y["home_team"]))
+    pf_arr = np.array([pf.get(k, 1.0) for k in keys])
+    padj = df_y["woba_value"].to_numpy() / pf_arr
+    tmp = pd.DataFrame({"batter": df_y["batter"].to_numpy(),
+                        "pitcher": df_y["pitcher"].to_numpy(), "padj": padj})
+    b_woba = tmp.groupby("batter")["padj"].mean()
+    p_woba = tmp.groupby("pitcher")["padj"].mean()
+    b_plus = {int(p): round(100 * w / lw) for p, w in b_woba.items()}
+    p_minus = {int(p): round(100 * w / lw) for p, w in p_woba.items()}
+    return b_plus, p_minus
+
+
+@st.cache_data(show_spinner=False)
+def cached_clutch(years: tuple[int, ...], league_woba: float):
+    """
+    Per-PA: actual wOBA, ELO-expected wOBA (park-adjusted), the residual, the
+    opponent's ELO, and whether the PA was high-leverage (late & close:
+    inning >= 7 and within 2 runs). The residual vs expectation is the key —
+    it credits production against the tough arms that show up in clutch spots.
+    """
+    df_y, _ = cached_fetch(years)
+    res = cached_elo(years, league_woba)
+    br, pr = res[0], res[1]
+    pf = compute_park_factors(df_y)
+    keys = list(zip(df_y["season"].astype(int), df_y["home_team"]))
+    pf_arr = np.array([pf.get(k, 1.0) for k in keys])
+
+    b_elo = df_y["batter"].map(br).fillna(1500).to_numpy(dtype=float)
+    p_elo = df_y["pitcher"].map(pr).fillna(1500).to_numpy(dtype=float)
+    p_win = 1 / (1 + 10 ** ((p_elo - b_elo) / 400))
+    exp = 2 * league_woba * p_win * pf_arr
+    actual = df_y["woba_value"].to_numpy(dtype=float)
+
+    inning = pd.to_numeric(df_y.get("inning"), errors="coerce").fillna(1).to_numpy()
+    diff = (pd.to_numeric(df_y.get("bat_score"), errors="coerce").fillna(0)
+            - pd.to_numeric(df_y.get("fld_score"), errors="coerce").fillna(0)).abs().to_numpy()
+    high = (inning >= 7) & (diff <= 2)
+
+    return pd.DataFrame({
+        "batter": df_y["batter"].to_numpy(), "pitcher": df_y["pitcher"].to_numpy(),
+        "woba": actual, "exp": exp, "resid": actual - exp,
+        "b_elo": b_elo, "p_elo": p_elo, "high": high,
+    })
+
+
+@st.cache_data(show_spinner=False)
+def season_index_corr(year: int, min_pa_corr: int):
+    """Per-season R² between model ELO index and actual park-adjusted wOBA index."""
+    df_y, _, lw, res = season_bundle(year)
+    br, pr, bavg, pavg = res[0], res[1], res[2], res[3]
+    bpa = df_y.groupby("batter").size()
+    ppa = df_y.groupby("pitcher").size()
+    b_actual, p_actual = cached_actual_indices((year,))
+
+    def _r2(ratings, avg, pa, actual, role):
+        pairs = []
+        for pid in ratings:
+            if pa.get(pid, 0) < min_pa_corr or actual.get(pid) is None:
+                continue
+            model = elo_index(avg.get(pid, ratings[pid]), lw, role)
+            pairs.append((actual[pid], model))
+        if len(pairs) < 3:
+            return None, len(pairs)
+        a, m = zip(*pairs)
+        return float(np.corrcoef(a, m)[0, 1]) ** 2, len(pairs)
+
+    b_r2, b_n = _r2(br, bavg, bpa, b_actual, "batter")
+    p_r2, p_n = _r2(pr, pavg, ppa, p_actual, "pitcher")
+    return b_r2, b_n, p_r2, p_n
+
+
+def available_cached_years() -> list[int]:
+    ys = []
+    for f in glob.glob(os.path.join(os.path.dirname(__file__), "cache", "statcast_*.parquet")):
+        try:
+            ys.append(int(os.path.basename(f).split("_")[1].split(".")[0]))
+        except (IndexError, ValueError):
+            pass
+    return sorted(ys)
 
 
 @st.cache_data(show_spinner=False)
@@ -109,15 +202,239 @@ display_names: dict[int, str] = {
 batter_pa = df.groupby("batter").size()
 pitcher_pa = df.groupby("pitcher").size()
 
-leaderboard = build_leaderboard(batter_ratings, batter_avg, batter_peak, batter_worst, display_names, batter_pa, min_pa, sort_by, team_filter, batter_teams)
-pitcher_board = build_leaderboard(pitcher_ratings, pitcher_avg, pitcher_peak, pitcher_worst, display_names, pitcher_pa, min_pa, sort_by, team_filter, pitcher_teams)
+# Model index (ELO+/ELO-) from Avg ELO, and actual park-adjusted wOBA index
+batter_eloplus = {pid: elo_index(batter_avg.get(pid, batter_ratings[pid]), league_woba, "batter")
+                  for pid in batter_ratings}
+pitcher_elominus = {pid: elo_index(pitcher_avg.get(pid, pitcher_ratings[pid]), league_woba, "pitcher")
+                    for pid in pitcher_ratings}
+batter_wobaplus, pitcher_wobaminus = cached_actual_indices(selected_years)
+
+# Average opponent strength faced (mean End ELO of the opponents in each PA;
+# End ELO is recentered to a PA-weighted 1500, so the measure is well-centered)
+bat_strength = batter_ratings
+pit_strength = pitcher_ratings
+_opp = df[["batter", "pitcher"]].copy()
+_opp["opp_for_batter"] = _opp["pitcher"].map(pit_strength)
+_opp["opp_for_pitcher"] = _opp["batter"].map(bat_strength)
+batter_opp_elo = _opp.groupby("batter")["opp_for_batter"].mean().round(0).to_dict()
+pitcher_opp_elo = _opp.groupby("pitcher")["opp_for_pitcher"].mean().round(0).to_dict()
+
+leaderboard = build_leaderboard(
+    batter_ratings, batter_avg, batter_peak, batter_worst, display_names, batter_pa,
+    min_pa, sort_by, team_filter, batter_teams,
+    extra_columns={"ELO+": batter_eloplus, "wOBA+": batter_wobaplus, "Opp ELO": batter_opp_elo},
+)
+pitcher_board = build_leaderboard(
+    pitcher_ratings, pitcher_avg, pitcher_peak, pitcher_worst, display_names, pitcher_pa,
+    min_pa, sort_by, team_filter, pitcher_teams,
+    extra_columns={"ELO−": pitcher_elominus, "wOBA-agst−": pitcher_wobaminus, "Opp ELO": pitcher_opp_elo},
+)
 
 # ── Leaderboards ──────────────────────────────────────────────────────────────
 st.subheader("Batters")
+st.caption("ELO+ = model talent index (from Avg ELO). wOBA+ = actual park-adjusted "
+           "seasonal wOBA, indexed to 100 (≈ wRC+). Both: 100 = average, higher = better.")
 st.dataframe(leaderboard, use_container_width=True, hide_index=True, height=600)
 
 st.subheader("Pitchers")
+st.caption("ELO− = model talent index (from Avg ELO). wOBA-agst− = actual park-adjusted "
+           "wOBA allowed, indexed to 100 (≈ ERA−/FIP−). Both: 100 = average, lower = better.")
 st.dataframe(pitcher_board, use_container_width=True, hide_index=True, height=600)
+
+# ── Validation: model vs raw, and strength of schedule ────────────────────────
+with st.expander("ELO vs raw production — and who faced the toughest competition"):
+    st.markdown(
+        "**Reading the scatter.** Each dot is a player. The horizontal axis is what they "
+        "actually produced — park-adjusted wOBA, indexed so 100 = league average. The vertical "
+        "axis is their ELO rating on that same scale. On the diagonal = ELO and raw production "
+        "agree. Off the diagonal = the value raw rate stats miss: **leverage** (production in "
+        "high win-probability spots), **timing/path** (when in the season it happened), and a "
+        "smaller piece, **strength of schedule** (who they faced). The tables below isolate that "
+        "last piece — who faced the toughest and weakest competition."
+    )
+    v_tab_b, v_tab_p = st.tabs(["Batters", "Pitchers"])
+
+    def _scatter(board, model_col, actual_col):
+        sub = board.dropna(subset=[model_col, actual_col])
+        if len(sub) < 3:
+            st.info("Not enough qualified players at this Min PA threshold.")
+            return
+        r = float(np.corrcoef(sub[model_col], sub[actual_col])[0, 1])
+        slope, intercept = np.polyfit(sub[actual_col], sub[model_col], 1)
+        fig_v = go.Figure()
+        fig_v.add_trace(go.Scatter(
+            x=sub[actual_col], y=sub[model_col], mode="markers",
+            text=sub["Name"], hovertemplate="%{text}<br>actual %{x}<br>model %{y}<extra></extra>",
+            marker=dict(size=6, opacity=0.6),
+        ))
+        lo = min(sub[model_col].min(), sub[actual_col].min())
+        hi = max(sub[model_col].max(), sub[actual_col].max())
+        fig_v.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines",
+                                   line=dict(dash="dash", color="gray"), name="y = x"))
+        fig_v.add_trace(go.Scatter(x=[lo, hi], y=[slope * lo + intercept, slope * hi + intercept],
+                                   mode="lines", line=dict(color="firebrick"), name="best fit"))
+        fig_v.update_layout(
+            title=f"r = {r:.3f}   R² = {r**2:.3f}   (n = {len(sub)})",
+            xaxis_title=f"Actual {actual_col}", yaxis_title=f"Model {model_col}",
+            showlegend=False,
+        )
+        st.plotly_chart(fig_v, use_container_width=True, key=f"scatter_{model_col}")
+
+    def _schedule_analysis(board, model_col, actual_col, lower_better):
+        sub = board.dropna(subset=[model_col, actual_col, "Opp ELO"]).copy()
+        if len(sub) < 5:
+            return
+        # gap = how much ELO credits a player vs their raw line (positive = underrated)
+        sub["gap"] = ((sub[actual_col] - sub[model_col]) if lower_better
+                      else (sub[model_col] - sub[actual_col]))
+        lo, hi = sub["Opp ELO"].min(), sub["Opp ELO"].max()
+        r_opp = float(np.corrcoef(sub["Opp ELO"], sub["gap"])[0, 1])
+        st.markdown(
+            f"**Strength of schedule is real but small.** Average opponent ELO spans only "
+            f"**{lo:.0f}–{hi:.0f}** here — over a full season everyone faces near-league-average "
+            f"competition (you never face your own staff, and the rest of the slate is fairly "
+            f"balanced). It correlates only **r = {r_opp:.2f}** with the ELO-vs-raw gap, so "
+            f"opponents explain just a sliver of it; most of the gap is **leverage and timing**. "
+            f"Still, at the margins it nudges these players:"
+        )
+        cols = ["Name", actual_col, model_col, "Opp ELO"]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Toughest schedule** — faced the best opponents (raw stats understate them)")
+            st.dataframe(sub.sort_values("Opp ELO", ascending=False).head(12)[cols],
+                         use_container_width=True, hide_index=True)
+        with c2:
+            st.markdown("**Easiest schedule** — faced the weakest opponents (raw stats flatter them)")
+            st.dataframe(sub.sort_values("Opp ELO").head(12)[cols],
+                         use_container_width=True, hide_index=True)
+
+    with v_tab_b:
+        _scatter(leaderboard, "ELO+", "wOBA+")
+        _schedule_analysis(leaderboard, "ELO+", "wOBA+", lower_better=False)
+    with v_tab_p:
+        _scatter(pitcher_board, "ELO−", "wOBA-agst−")
+        _schedule_analysis(pitcher_board, "ELO−", "wOBA-agst−", lower_better=True)
+
+# ── Clutch & leverage ─────────────────────────────────────────────────────────
+with st.expander("Clutch & Leverage — is there clutch, once you adjust for who you faced?"):
+    st.markdown(
+        "Sabermetrics says clutch barely exists — but that may be unfair. **High-leverage spots "
+        "(late & close: 7th inning or later, within 2 runs) are when the best relievers pitch.** "
+        "So a hitter's raw clutch line is built against tougher arms than usual. Here, each "
+        "high-leverage PA is scored against its **ELO-expected** wOBA — which already accounts "
+        "for that nasty closer — so **Clutch+** = how much a hitter beat expectation when it "
+        "mattered, against the competition they actually faced."
+    )
+    clutch_df = cached_clutch(selected_years, league_woba)
+    min_hi_pa = st.slider("Min high-leverage PAs", 20, 200, 50, 10, key="clutch_minpa")
+
+    c_tab_b, c_tab_p = st.tabs(["Batters", "Pitchers"])
+
+    def _clutch_table(role: str):
+        opp_col = "p_elo" if role == "batter" else "b_elo"
+        id_col = "batter" if role == "batter" else "pitcher"
+        rated = batter_ratings if role == "batter" else pitcher_ratings
+        # Premise: are opponents tougher in high leverage?
+        opp_hi = clutch_df.loc[clutch_df["high"], opp_col].mean()
+        opp_lo = clutch_df.loc[~clutch_df["high"], opp_col].mean()
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Avg opponent ELO — high leverage", f"{opp_hi:.0f}")
+        m2.metric("Avg opponent ELO — low leverage", f"{opp_lo:.0f}")
+        m3.metric("Clutch competition premium", f"{opp_hi - opp_lo:+.0f}",
+                  help="Higher = you face meaningfully tougher arms/bats in the clutch.")
+
+        hi = clutch_df[clutch_df["high"]]
+        g = hi.groupby(id_col)
+        sign = 1 if role == "batter" else -1  # pitchers: allowing less than expected is good
+        tbl = pd.DataFrame({
+            "HiLev PA": g.size(),
+            "HiLev wOBA": g["woba"].mean().round(3),
+            "Opp ELO": g[opp_col].mean().round(0),
+            "Exp wOBA": g["exp"].mean().round(3),
+            "Clutch+": (sign * g["resid"].mean()).round(3),
+        })
+        tbl = tbl[tbl["HiLev PA"] >= min_hi_pa]
+        tbl.insert(0, "Name", [display_names.get(int(i), f"ID:{i}") for i in tbl.index])
+        tbl = tbl.sort_values("Clutch+", ascending=False).reset_index(drop=True)
+
+        st.caption("Clutch+ > 0 = produced better than ELO expected in high-leverage spots "
+                   "(beat tough competition when it counted). Higher Opp ELO = faced nastier arms/bats.")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.markdown("**Most clutch** (beat expectation in the clutch)")
+            st.dataframe(tbl.head(15), use_container_width=True, hide_index=True)
+        with cc2:
+            st.markdown("**Least clutch** (fell short when it mattered)")
+            st.dataframe(tbl.tail(15).iloc[::-1].reset_index(drop=True),
+                         use_container_width=True, hide_index=True)
+
+    with c_tab_b:
+        _clutch_table("batter")
+    with c_tab_p:
+        _clutch_table("pitcher")
+
+# ── Correlation over time ─────────────────────────────────────────────────────
+with st.expander("Correlation Over Time — is the model tracking reality more closely?"):
+    st.caption(
+        "Per-season R² between the model index (ELO+/ELO−) and actual park-adjusted "
+        "wOBA, then a linear trend across seasons. The trend's own R² says how well a "
+        "straight line describes that year-to-year movement; the slope says the direction. "
+        "(Actual = wOBA-based, since FanGraphs OPS+/wRC+ scraping is currently blocked.)"
+    )
+    corr_years = available_cached_years()
+    st.caption(f"Showing all loaded seasons: {', '.join(map(str, corr_years)) or 'none'}. "
+               "Load more seasons from the sidebar and they appear here automatically.")
+    min_pa_corr = st.slider("Min PA per season for correlation", 100, 600, 300, 50, key="corr_minpa")
+
+    if len(corr_years) >= 2:
+        rows = []
+        for y in sorted(corr_years):
+            b_r2, b_n, p_r2, p_n = season_index_corr(y, min_pa_corr)
+            rows.append({"Season": y, "Batter R²": b_r2, "Batter n": b_n,
+                         "Pitcher R²": p_r2, "Pitcher n": p_n})
+        corr_df = pd.DataFrame(rows)
+
+        def _trend(xs, ys):
+            mask = [v is not None for v in ys]
+            xs2 = np.array([x for x, m in zip(xs, mask) if m], float)
+            ys2 = np.array([v for v, m in zip(ys, mask) if m], float)
+            if len(xs2) < 2:
+                return None
+            slope, intercept = np.polyfit(xs2, ys2, 1)
+            pred = slope * xs2 + intercept
+            ss_res = ((ys2 - pred) ** 2).sum()
+            ss_tot = ((ys2 - ys2.mean()) ** 2).sum()
+            trend_r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+            return slope, intercept, trend_r2, xs2
+
+        fig_t = go.Figure()
+        summary = []
+        for col, color in [("Batter R²", "#1f77b4"), ("Pitcher R²", "#ff7f0e")]:
+            ys = corr_df[col].tolist()
+            xs = corr_df["Season"].tolist()
+            fig_t.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name=col,
+                                       line=dict(color=color)))
+            tr = _trend(xs, ys)
+            if tr:
+                slope, intercept, trend_r2, xs2 = tr
+                fig_t.add_trace(go.Scatter(
+                    x=[xs2.min(), xs2.max()],
+                    y=[slope * xs2.min() + intercept, slope * xs2.max() + intercept],
+                    mode="lines", line=dict(color=color, dash="dash"),
+                    name=f"{col} trend", showlegend=False,
+                ))
+                direction = "increasing" if slope > 0 else "decreasing"
+                summary.append(
+                    f"**{col}**: slope = {slope:+.4f}/yr ({direction}), trend R² = {trend_r2:.3f}"
+                )
+        fig_t.update_layout(xaxis_title="Season", yaxis_title="R² (model vs actual)",
+                            yaxis_range=[0, 1])
+        st.plotly_chart(fig_t, use_container_width=True, key="corr_over_time")
+        for line in summary:
+            st.markdown(line)
+        st.dataframe(corr_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Pick at least two seasons to see a trend.")
 
 # ── Matchup predictor (cross-year) ────────────────────────────────────────────
 st.subheader("Matchup Predictor")

@@ -23,6 +23,7 @@ KEEP_COLS = [
     "batter", "pitcher",
     "events",
     "home_team", "away_team", "inning_topbot",
+    "inning", "bat_score", "fld_score",    # pre-PA game state for leverage (late & close)
     "woba_value",                          # iter 2: actual wOBA weight
     "estimated_woba_using_speedangle",     # iter 3: xwOBA
     "delta_home_win_exp",                  # leverage proxy
