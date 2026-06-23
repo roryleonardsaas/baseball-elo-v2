@@ -576,9 +576,13 @@ st.plotly_chart(fig, use_container_width=True)
 # ── Player rating over time ───────────────────────────────────────────────────
 st.subheader("ELO Rating Over Time")
 
-# Display name → player id for the loaded scope (drives the time-series picker)
-batter_label_to_id = {display_names[pid]: pid for pid in batter_ratings}
-pitcher_label_to_id = {display_names[pid]: pid for pid in pitcher_ratings}
+# Display name → player id for the loaded scope (drives the time-series picker).
+# Filter to players meeting the Min PA bar and that have a real name — this drops
+# 1-PA noise and any IDs the MLBAM lookup couldn't resolve.
+batter_label_to_id = {display_names[pid]: pid for pid in batter_ratings
+                      if batter_pa.get(pid, 0) >= min_pa and not display_names[pid].startswith("ID:")}
+pitcher_label_to_id = {display_names[pid]: pid for pid in pitcher_ratings
+                       if pitcher_pa.get(pid, 0) >= min_pa and not display_names[pid].startswith("ID:")}
 
 def build_compressed_chart(histories: dict[str, list], role_label: str,
                            names: dict[int, str]) -> go.Figure:
