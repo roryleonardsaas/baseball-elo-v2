@@ -39,6 +39,26 @@ ON_BASE = {"single", "double", "triple", "home_run", "walk", "hit_by_pitch"}
 # Event-code prefixes that are NOT plate appearances (the batter re-appears with the real result)
 _SKIP_PREFIXES = ("NP", "SB", "CS", "PO", "WP", "PB", "BK", "DI", "OA", "FLE")
 
+# Lazily-loaded {retro_id: (first_year, last_year)} for disambiguating shared names
+# (e.g. Ken Griffey Sr 1973–1991 vs Jr 1989–2010).
+_RETRO_SPANS: dict | None = None
+
+
+def _retro_year_spans() -> dict:
+    global _RETRO_SPANS
+    if _RETRO_SPANS is None:
+        _RETRO_SPANS = {}
+        try:
+            from pybaseball import chadwick_register
+            reg = chadwick_register()
+            for r in reg.itertuples():
+                rid = r.key_retro
+                if isinstance(rid, str) and rid and pd.notna(r.mlb_played_first):
+                    _RETRO_SPANS[rid] = (int(r.mlb_played_first), int(r.mlb_played_last))
+        except Exception:
+            _RETRO_SPANS = {}
+    return _RETRO_SPANS
+
 
 def _classify(event: str) -> str | None:
     """Map a Retrosheet event code to an outcome category, or None if it isn't a PA."""
@@ -131,8 +151,21 @@ def parse_season(year: int) -> tuple[pd.DataFrame, dict[int, str]]:
     df["fld_score"] = 0
     df["season"] = year
 
-    names = {syn_id: retro_names.get(rid, str(rid)) for rid, syn_id in registry.items()
-             if syn_id in set(df["batter"]) | set(df["pitcher"])}
+    present = set(df["batter"]) | set(df["pitcher"])
+    inv = {syn_id: rid for rid, syn_id in registry.items()}  # syn_id -> retro_id
+    names = {syn_id: retro_names.get(inv[syn_id], str(syn_id)) for syn_id in present}
+
+    # Disambiguate shared names by active-year span (Griffey Sr vs Jr), falling
+    # back to the Retrosheet id if the span is unknown.
+    from collections import Counter
+    dup_names = {nm for nm, c in Counter(names.values()).items() if c > 1}
+    if dup_names:
+        spans = _retro_year_spans()
+        for syn_id, nm in list(names.items()):
+            if nm in dup_names:
+                rid = inv[syn_id]
+                span = spans.get(rid)
+                names[syn_id] = f"{nm} ({span[0]}–{span[1]})" if span else f"{nm} [{rid}]"
 
     df.to_parquet(cache_path)
     pd.DataFrame({"syn_id": list(names), "name": list(names.values())}).to_parquet(names_path)

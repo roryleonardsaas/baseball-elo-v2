@@ -108,15 +108,17 @@ def season_index_corr(year: int, min_pa_corr: int):
 def available_cached_years() -> list[int]:
     ys = []
     cache = os.path.join(os.path.dirname(__file__), "cache")
-    for pattern in ("statcast_*.parquet", "retro_2*.parquet"):
+    for pattern in ("statcast_*.parquet", "retro_*.parquet"):
         for f in glob.glob(os.path.join(cache, pattern)):
             base = os.path.basename(f)
             if base.startswith("retro_names"):
                 continue
             try:
-                ys.append(int(base.split("_")[1].split(".")[0]))
+                y = int(base.split("_")[1].split(".")[0])
             except (IndexError, ValueError):
-                pass
+                continue  # e.g. retro_id_registry.parquet
+            if 1900 <= y <= 2100:
+                ys.append(y)
     return sorted(set(ys))
 
 
@@ -127,6 +129,33 @@ def season_bundle(year: int):
     lw = round(float(df_y["woba_value"].mean()), 4)
     res = cached_elo((year,), lw)
     return df_y, names_y, lw, res
+
+
+@st.cache_data(show_spinner=False)
+def season_player_labels(year: int, role: str, min_pa_mp: int = 50) -> dict[str, int]:
+    """
+    Cheap dropdown source: player label -> id for one season+role, using only the
+    parsed data (NO ELO run). Lets the matchup picker populate fast; ELO is computed
+    only when a matchup is actually requested.
+    """
+    df_y, names_y = cached_fetch((year,))
+    id_col = "batter" if role == "batter" else "pitcher"
+    pa = df_y.groupby(id_col).size()
+    counts = Counter(names_y.values())
+    opts: dict[str, int] = {}
+    for pid, n in pa.items():
+        if n < min_pa_mp:
+            continue
+        nm = names_y.get(pid, f"ID:{pid}")
+        label = f"{nm} ({pid})" if counts.get(nm, 1) > 1 else nm
+        opts[label] = int(pid)
+    return opts
+
+
+@st.cache_data(show_spinner=False)
+def season_league_woba(year: int) -> float:
+    df_y, _ = cached_fetch((year,))
+    return round(float(df_y["woba_value"].mean()), 4)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -162,7 +191,10 @@ with st.sidebar:
     st.caption("Iteration 1 — on-base vs out only")
 
 # ── Load data ─────────────────────────────────────────────────────────────────
-with st.spinner(f"Loading {scope_label} Statcast data (first run: a few minutes per season)…"):
+_src = ("Retrosheet" if all(y < 2015 for y in selected_years)
+        else "Statcast" if all(y >= 2015 for y in selected_years)
+        else "Statcast + Retrosheet")
+with st.spinner(f"Loading {scope_label} {_src} data (first run: a few minutes per season)…"):
     df, names = cached_fetch(selected_years)
 
 league_woba = round(float(df["woba_value"].mean()), 4)
@@ -451,24 +483,16 @@ st.caption(
     "season level (recommended); End/Peak available too."
 )
 
+st.caption("Pick a season → the dropdown loads instantly (names only). "
+           "Ratings are computed only when you've chosen both players.")
 _metric_idx = {"Avg ELO": 2, "End ELO": 0, "Peak ELO": 4}
 
 
-def _season_player_options(year: int, role: str, metric: str, min_pa_mp: int = 50):
-    """Return (label->（pid, rating), names, df, league_woba) for one season+role."""
-    df_y, names_y, lw, res = season_bundle(year)
+def _rating_for(year: int, pid: int, role: str, metric: str) -> float:
+    """Run (cached) ELO for one season and return the chosen rating for one player."""
+    _, _, _, res = season_bundle(year)
     ratings = res[_metric_idx[metric] + (0 if role == "batter" else 1)]
-    id_col = "batter" if role == "batter" else "pitcher"
-    pa = df_y.groupby(id_col).size()
-    counts = Counter(names_y.values())
-    opts = {}
-    for pid, rating in ratings.items():
-        if pa.get(pid, 0) < min_pa_mp:
-            continue
-        nm = names_y.get(pid, f"ID:{pid}")
-        label = f"{nm} ({pid})" if counts.get(nm, 1) > 1 else nm
-        opts[label] = (pid, rating)
-    return opts, names_y, df_y, lw
+    return ratings.get(pid, 1500.0)
 
 
 mp_metric = st.radio("Rating to use", ["Avg ELO", "End ELO", "Peak ELO"], horizontal=True, key="mp_metric")
@@ -477,22 +501,24 @@ mc1, mc2, mc3 = st.columns(3)
 with mc1:
     st.markdown("**Batter**")
     b_year = st.selectbox("Batter season", all_years, index=0, key="mp_b_year")
-    b_opts, _, b_df, _ = _season_player_options(b_year, "batter", mp_metric)
+    b_opts = season_player_labels(b_year, "batter")          # cheap: names only, no ELO
     batter_pick = st.selectbox("Batter", [""] + sorted(b_opts), key="mp_batter")
 with mc2:
     st.markdown("**Pitcher**")
     p_year = st.selectbox("Pitcher season", all_years, index=0, key="mp_p_year")
-    p_opts, _, p_df, _ = _season_player_options(p_year, "pitcher", mp_metric)
+    p_opts = season_player_labels(p_year, "pitcher")
     pitcher_pick = st.selectbox("Pitcher", [""] + sorted(p_opts), key="mp_pitcher")
 with mc3:
     st.markdown("**Run environment**")
     env_year = st.selectbox("Season (sets league wOBA)", all_years, index=0, key="mp_env_year")
-    _, _, env_lw, _ = season_bundle(env_year)
+    env_lw = season_league_woba(env_year)                    # cheap: league mean, no ELO
     st.metric(f"{env_year} league wOBA", f"{env_lw:.3f}")
 
 if batter_pick and pitcher_pick:
-    b_id, r_b = b_opts[batter_pick]
-    p_id, r_p = p_opts[pitcher_pick]
+    b_id, p_id = b_opts[batter_pick], p_opts[pitcher_pick]
+    with st.spinner("Computing ratings…"):                   # ELO runs here, only now
+        r_b = _rating_for(b_year, b_id, "batter", mp_metric)
+        r_p = _rating_for(p_year, p_id, "pitcher", mp_metric)
     exp_woba = expected_woba(r_b, r_p, env_lw)
 
     r1, r2, r3, r4 = st.columns(4)
@@ -503,6 +529,7 @@ if batter_pick and pitcher_pick:
 
     # Real head-to-head only exists if both came from the same season
     if b_year == p_year:
+        b_df, _ = cached_fetch((b_year,))
         h2h = b_df[(b_df["batter"] == b_id) & (b_df["pitcher"] == p_id)]
         if len(h2h) > 0:
             with st.expander(f"Real head-to-head, {b_year} ({len(h2h)} PA)"):

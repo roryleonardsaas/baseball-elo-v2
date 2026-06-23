@@ -8,8 +8,12 @@ venv/
 # Regeneratable ELO computation caches (large; rebuilt on first run)
 cache/elo_*.pkl
 
-# Raw Retrosheet event-file downloads (re-downloaded; parsed parquets are kept)
+# Raw Retrosheet event-file downloads (re-downloaded on demand)
 retrosheet_raw/
+
+# Parsed Retrosheet caches: regenerated, and the synthetic player-ID registry is
+# machine-local, so these are not tracked (unlike the stable Statcast parquets).
+cache/retro_*.parquet
 
 # OS / editor
 .DS_Store
