@@ -577,12 +577,23 @@ st.plotly_chart(fig, use_container_width=True)
 st.subheader("ELO Rating Over Time")
 
 # Display name → player id for the loaded scope (drives the time-series picker).
-# Filter to players meeting the Min PA bar and that have a real name — this drops
-# 1-PA noise and any IDs the MLBAM lookup couldn't resolve.
-batter_label_to_id = {display_names[pid]: pid for pid in batter_ratings
-                      if batter_pa.get(pid, 0) >= min_pa and not display_names[pid].startswith("ID:")}
-pitcher_label_to_id = {display_names[pid]: pid for pid in pitcher_ratings
-                       if pitcher_pa.get(pid, 0) >= min_pa and not display_names[pid].startswith("ID:")}
+# With a Team Filter active, show every player on that team regardless of PA.
+# Otherwise, filter to players meeting the Min PA bar (drops 1-PA noise).
+# Unnamed "ID:" players are always excluded (nothing useful to chart).
+def _picker(ratings, pa_counts, teams):
+    out = {}
+    for pid in ratings:
+        if display_names[pid].startswith("ID:"):
+            continue
+        if team_filter:
+            if teams.get(pid) in team_filter:
+                out[display_names[pid]] = pid
+        elif pa_counts.get(pid, 0) >= min_pa:
+            out[display_names[pid]] = pid
+    return out
+
+batter_label_to_id = _picker(batter_ratings, batter_pa, batter_teams)
+pitcher_label_to_id = _picker(pitcher_ratings, pitcher_pa, pitcher_teams)
 
 def build_compressed_chart(histories: dict[str, list], role_label: str,
                            names: dict[int, str]) -> go.Figure:
