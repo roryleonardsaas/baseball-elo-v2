@@ -7,17 +7,23 @@ import plotly.graph_objects as go
 from collections import Counter
 
 from data_fetch import fetch_seasons
-from elo import run_elo, build_leaderboard, expected_woba, compute_park_factors, elo_index, REPLACEMENT_ELO
+from elo import (run_elo, build_leaderboard, expected_woba, compute_park_factors, elo_index,
+                 REPLACEMENT_ELO, VALUE_SCALE)
 
 
-def _value(elo: float, pa_num: float, full_volume: float) -> float:
-    """ELO Value: ELO scaled toward the replacement floor by how much volume is in yet."""
-    return REPLACEMENT_ELO + (elo - REPLACEMENT_ELO) * min(pa_num / full_volume, 1.0)
+def _war_value(elo: float, credibility: float) -> float:
+    """ELO Value on a WAR-like scale (replacement = 0): skill above replacement × volume."""
+    return (elo - REPLACEMENT_ELO) * credibility / VALUE_SCALE
 
 
 def value_history(hist: list, full_volume: float) -> list:
-    """Transform a per-PA ELO history into an ELO-Value history (rating at index 2)."""
-    return [(t[0], t[1], round(_value(t[2], t[0], full_volume), 1)) + tuple(t[3:]) for t in hist]
+    """Transform a per-PA ELO history into a WAR-scale ELO-Value history (value at index 2).
+    Uses the player's full-season volume credibility, so the curve keeps the ELO shape
+    (real hot/cold streaks) on the value scale."""
+    if not hist:
+        return hist
+    cred = min(hist[-1][0] / full_volume, 1.0)  # total PA = last entry's running count
+    return [(t[0], t[1], round(_war_value(t[2], cred), 2)) + tuple(t[3:]) for t in hist]
 
 st.set_page_config(page_title="Baseball ELO", layout="wide")
 st.title("Baseball ELO Ratings — Iteration 2: wOBA + Park Factors")
@@ -148,12 +154,13 @@ def elo_value_metrics(years: tuple[int, ...], full_volume: int):
     def metrics(hist):
         end, avg, peak, worst = {}, {}, {}, {}
         for pid, h in hist.items():
-            vals = [_value(t[2], t[0], full_volume) for t in h]
-            end[pid] = round(vals[-1], 1)
-            peak[pid] = round(max(vals), 1)
-            worst[pid] = round(min(vals), 1)
+            cred = min(h[-1][0] / full_volume, 1.0)
+            vals = [_war_value(t[2], cred) for t in h]
+            end[pid] = round(vals[-1], 2)
+            peak[pid] = round(max(vals), 2)
+            worst[pid] = round(min(vals), 2)
             post = [v for t, v in zip(h, vals) if t[0] > warmup]
-            avg[pid] = round(sum(post) / len(post), 1) if post else round(vals[-1], 1)
+            avg[pid] = round(sum(post) / len(post), 2) if post else round(vals[-1], 2)
         return end, avg, peak, worst
 
     return metrics(b_hist), metrics(p_hist)
@@ -224,20 +231,21 @@ with st.sidebar:
 
     metric_mode = st.radio(
         "Rating", ["ELO", "ELO Value"], horizontal=True,
-        help="ELO: pure per-PA skill (rate). ELO Value: ELO scaled by playing time, so "
-             "a full-workload player keeps their ELO and a part-timer is dragged toward "
-             "replacement. Everything below — leaderboard, graph, avg/peak/worst — follows it.",
+        help="ELO: pure per-PA skill (rate, ~1500 scale). ELO Value: skill above replacement "
+             "× playing time, on a WAR-like scale (replacement = 0, elite ≈ 5–6). The toggle "
+             "switches the leaderboard, graph, and avg/peak/worst all at once.",
     )
     full_volume = st.slider(
         "PAs (batters) / batters faced (pitchers) for full credit", 100, 800, 500, 25,
-        help="In ELO Value, a player needs this much volume to be rated at their full ELO; "
-             "less volume scales the rating toward replacement. Higher = innings matter more.",
+        help="In ELO Value, a player needs this much volume for full value credit; less volume "
+             "scales their value down. Higher = innings matter more.",
         disabled=(metric_mode == "ELO"),
     )
 
     min_pa = st.slider("Min PA for leaderboard", 10, 1000, 100, 10)
-    sort_by = st.radio("Sort leaderboard by", ["End ELO", "Avg ELO", "Peak ELO", "Worst ELO", "Range"],
-                       help="End: current rating. Peak/Worst: hottest/lowest point. Avg: sustained value. Range: Peak minus Worst (streakiness). In ELO Value mode these columns show ELO Value.")
+    sort_by = st.radio("Sort leaderboard by", ["End", "Avg", "Peak", "Worst", "Range"],
+                       help="End: current rating. Peak/Worst: hottest/lowest point. Avg: sustained level. Range: Peak minus Worst (streakiness). Columns show ELO or ELO Value per the toggle.")
+    rating_label = "Value" if metric_mode == "ELO Value" else "ELO"
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 _src = ("Retrosheet" if all(y < 2015 for y in selected_years)
@@ -318,18 +326,20 @@ leaderboard = build_leaderboard(
     b_end, b_avg, b_peak, b_worst, display_names, batter_pa,
     min_pa, sort_by, team_filter, batter_teams,
     extra_columns={"ELO+": batter_eloplus, "wOBA+": batter_wobaplus, "Opp ELO": batter_opp_elo},
+    rating_label=rating_label,
 )
 pitcher_board = build_leaderboard(
     p_end, p_avg, p_peak, p_worst, display_names, pitcher_pa,
     min_pa, sort_by, team_filter, pitcher_teams,
     extra_columns={"ELO−": pitcher_elominus, "wOBA-agst−": pitcher_wobaminus, "Opp ELO": pitcher_opp_elo},
+    rating_label=rating_label,
 )
 
 # ── Leaderboards ──────────────────────────────────────────────────────────────
 if metric_mode == "ELO Value":
-    st.info(f"**ELO Value mode** — the End/Avg/Peak/Worst columns show volume-adjusted ELO "
-            f"(full credit at {full_volume} PA/BF; less volume scales toward {REPLACEMENT_ELO:.0f}). "
-            f"Switch the sidebar Rating toggle back to **ELO** for pure rate.")
+    st.info(f"**ELO Value mode** — End/Avg/Peak/Worst are on a WAR-like scale (replacement = 0, "
+            f"elite ≈ 5–6): skill above replacement × volume, full credit at {full_volume} PA/BF. "
+            f"Switch the sidebar Rating toggle back to **ELO** for the 1500-scale rate.")
 
 st.subheader("Batters")
 st.caption("ELO+ = model talent index (from Avg ELO). wOBA+ = actual park-adjusted "

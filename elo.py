@@ -10,6 +10,9 @@ DEFAULT_RATING = 1500.0
 # ELO Value = REPLACEMENT_ELO + (ELO − REPLACEMENT_ELO) × min(PA / full_workload, 1),
 # so a full-workload player keeps their ELO and a part-timer is scaled toward this floor.
 REPLACEMENT_ELO = 1360.0
+# ELO Value lives on a WAR-like scale (single digits, replacement = 0) so it's never
+# confused with an ELO number: value = (ELO − REPLACEMENT_ELO) × volume_credibility / VALUE_SCALE.
+VALUE_SCALE = 50.0
 # Times-through-the-order penalty: each time a pitcher cycles through the lineup,
 # expected wOBA-against rises (fatigue + hitter familiarity). Raising the expected
 # bar by this per turn means a hit given up deep in a start costs the pitcher less,
@@ -274,10 +277,11 @@ def build_leaderboard(
     display_names: dict[int, str],
     pa_counts: pd.Series,
     min_pa: int,
-    sort_by: str = "End ELO",
+    sort_by: str = "End",
     team_filter: set | None = None,
     player_teams: dict[int, str] | None = None,
     extra_columns: dict[str, dict[int, float]] | None = None,
+    rating_label: str = "ELO",
 ) -> pd.DataFrame:
     extra_columns = extra_columns or {}
     rows = []
@@ -290,10 +294,10 @@ def build_leaderboard(
         row = {
             "Name": display_names.get(pid, f"ID:{pid}"),
             "Team": team,
-            "End ELO": round(rating, 1),
-            "Avg ELO": avg_ratings.get(pid, round(rating, 1)),
-            "Peak ELO": round(peak_ratings.get(pid, rating), 1),
-            "Worst ELO": round(worst_ratings.get(pid, rating), 1),
+            f"End {rating_label}": round(rating, 1),
+            f"Avg {rating_label}": avg_ratings.get(pid, round(rating, 1)),
+            f"Peak {rating_label}": round(peak_ratings.get(pid, rating), 1),
+            f"Worst {rating_label}": round(worst_ratings.get(pid, rating), 1),
             "Range": round(peak_ratings.get(pid, rating) - worst_ratings.get(pid, rating), 1),
             "PA": int(pa_counts.get(pid, 0)),
         }
@@ -303,4 +307,7 @@ def build_leaderboard(
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    return df.sort_values(sort_by, ascending=False).reset_index(drop=True)
+    sort_col = "Range" if sort_by == "Range" else f"{sort_by} {rating_label}"
+    if sort_col not in df.columns:
+        sort_col = f"End {rating_label}"
+    return df.sort_values(sort_col, ascending=False).reset_index(drop=True)
