@@ -6,10 +6,11 @@ from collections import defaultdict
 import pandas as pd
 
 DEFAULT_RATING = 1500.0
-# Replacement level for the Value metric (Value = (AvgELO − this) × PA / 100).
-# Set below the 1500 pool mean so accumulating innings of decent work earns
-# positive value; the lower it is, the more volume outweighs rate.
-REPLACEMENT_ELO = 1350.0
+# Value = (AvgELO − replacement) × PA / VALUE_SCALE — rate above replacement × volume,
+# on a clean ~0–10 (WAR-like) scale. The replacement level is exposed to the user as an
+# "innings weight" slider: lower replacement → volume outweighs rate.
+REPLACEMENT_ELO = 1360.0
+VALUE_SCALE = 25000.0
 # Tuned for wOBA residuals. wOBA outcomes are leptokurtic (rare +1.5 HR jumps),
 # so a smaller K than the on-base era keeps the spread in standard ELO territory
 # (regulars ~1320-1900, elite ~1800) and keeps expected_woba reasonably calibrated.
@@ -264,6 +265,7 @@ def build_leaderboard(
     team_filter: set | None = None,
     player_teams: dict[int, str] | None = None,
     extra_columns: dict[str, dict[int, float]] | None = None,
+    replacement: float = REPLACEMENT_ELO,
 ) -> pd.DataFrame:
     extra_columns = extra_columns or {}
     rows = []
@@ -275,9 +277,10 @@ def build_leaderboard(
             continue
         pa = int(pa_counts.get(pid, 0))
         avg = avg_ratings.get(pid, round(rating, 1))
-        # Value = rate above replacement × volume (WAR-shaped). Credits durability:
-        # a workhorse at a modest rate can outrank an elite, low-volume reliever.
-        value = round((avg - REPLACEMENT_ELO) * pa / 100)
+        # Value = rate above replacement × volume (WAR-shaped, ~0–10). Credits
+        # durability: a workhorse at a modest rate can outrank an elite, low-volume
+        # reliever. Lower replacement → volume matters more.
+        value = round((avg - replacement) * pa / VALUE_SCALE, 1)
         row = {
             "Name": display_names.get(pid, f"ID:{pid}"),
             "Team": team,

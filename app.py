@@ -188,6 +188,12 @@ with st.sidebar:
     min_pa = st.slider("Min PA for leaderboard", 10, 1000, 100, 10)
     sort_by = st.radio("Sort leaderboard by", ["Value", "End ELO", "Avg ELO", "Peak ELO", "Worst ELO", "Range"],
                        help="Value: rate × playing time (credits innings/PA — a workhorse beats an elite low-volume arm). End ELO: current rating. Avg ELO: sustained rate. Peak/Worst: hottest/lowest point. Range: streakiness.")
+    innings_weight = st.slider(
+        "How much to reward innings / durability", 0, 100, 50, 5,
+        help="Higher = volume (innings/PA) counts more in Value; lower = pure rate matters more.",
+    )
+    # Map 0–100 to a replacement level: more innings weight → lower replacement.
+    replacement = 1420 - (innings_weight / 100) * (1420 - 1300)
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 _src = ("Retrosheet" if all(y < 2015 for y in selected_years)
@@ -260,11 +266,13 @@ leaderboard = build_leaderboard(
     batter_ratings, batter_avg, batter_peak, batter_worst, display_names, batter_pa,
     min_pa, sort_by, team_filter, batter_teams,
     extra_columns={"ELO+": batter_eloplus, "wOBA+": batter_wobaplus, "Opp ELO": batter_opp_elo},
+    replacement=replacement,
 )
 pitcher_board = build_leaderboard(
     pitcher_ratings, pitcher_avg, pitcher_peak, pitcher_worst, display_names, pitcher_pa,
     min_pa, sort_by, team_filter, pitcher_teams,
     extra_columns={"ELO−": pitcher_elominus, "wOBA-agst−": pitcher_wobaminus, "Opp ELO": pitcher_opp_elo},
+    replacement=replacement,
 )
 
 # ── Leaderboards ──────────────────────────────────────────────────────────────
