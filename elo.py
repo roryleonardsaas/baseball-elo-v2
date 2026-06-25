@@ -10,6 +10,12 @@ DEFAULT_RATING = 1500.0
 # ELO Value = REPLACEMENT_ELO + (ELO − REPLACEMENT_ELO) × min(PA / full_workload, 1),
 # so a full-workload player keeps their ELO and a part-timer is scaled toward this floor.
 REPLACEMENT_ELO = 1360.0
+# Times-through-the-order penalty: each time a pitcher cycles through the lineup,
+# expected wOBA-against rises (fatigue + hitter familiarity). Raising the expected
+# bar by this per turn means a hit given up deep in a start costs the pitcher less,
+# and an out earned deep counts more — neutralizing the structural disadvantage.
+# Data (2024): ~+0.036 the 2nd time, ~+0.082 the 3rd; 0.04/turn fits well.
+TTO_PENALTY = 0.04
 # Tuned for wOBA residuals. wOBA outcomes are leptokurtic (rare +1.5 HR jumps),
 # so a smaller K than the on-base era keeps the spread in standard ELO territory
 # (regulars ~1320-1900, elite ~1800) and keeps expected_woba reasonably calibrated.
@@ -17,7 +23,8 @@ BASE_K = 7.0
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
 
 # Bump when history tuple format changes so stale caches are ignored.
-_CACHE_VERSION = 8
+# v9: times-through-the-order penalty added to the expected value.
+_CACHE_VERSION = 9
 
 
 def expected_woba(r_batter: float, r_pitcher: float, league_woba: float) -> float:
@@ -129,6 +136,7 @@ def run_elo(
     pitcher_peak: dict[int, float] = {}
     batter_worst: dict[int, float] = {}
     pitcher_worst: dict[int, float] = {}
+    game_bf: dict = defaultdict(int)  # (game, pitcher) → batters faced so far this game
 
     for row in df.itertuples(index=False):
         b_id = int(row.batter)
@@ -141,11 +149,17 @@ def run_elo(
         r_b = batter_ratings.get(b_id, DEFAULT_RATING)
         r_p = pitcher_ratings.get(p_id, DEFAULT_RATING)
 
-        # Expected wOBA, then park-adjust: in a hitter's park (PF>1) the bar
-        # rises, so a given hit earns less and a given out costs more — exactly
-        # neutralizing the park's effect on the rating.
+        # Times-through-the-order: raise the expected bar as the pitcher goes deeper.
+        # Keyed per (game, pitcher), so a fresh reliever resets to the 1st time through.
+        game_bf[(row.game_pk, p_id)] += 1
+        times_through = (game_bf[(row.game_pk, p_id)] - 1) // 9
+        tto_factor = 1 + TTO_PENALTY * times_through
+
+        # Expected wOBA, park-adjusted and depth-adjusted: in a hitter's park (PF>1)
+        # or deep in a start (tto_factor>1) the bar rises, so a given hit earns less
+        # and a given out costs more — neutralizing park and fatigue effects.
         pf = park_factors.get((int(row.season), row.home_team), 1.0)
-        e = expected_woba(r_b, r_p, league_woba) * pf
+        e = expected_woba(r_b, r_p, league_woba) * pf * tto_factor
 
         # Dynamic K: leverage × career factor, computed independently per role.
         # woba_k_scale keeps the rating spread comparable to the on-base version.
