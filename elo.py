@@ -6,6 +6,10 @@ from collections import defaultdict
 import pandas as pd
 
 DEFAULT_RATING = 1500.0
+# Replacement level for the Value metric (Value = (AvgELO − this) × PA / 100).
+# Set below the 1500 pool mean so accumulating innings of decent work earns
+# positive value; the lower it is, the more volume outweighs rate.
+REPLACEMENT_ELO = 1350.0
 # Tuned for wOBA residuals. wOBA outcomes are leptokurtic (rare +1.5 HR jumps),
 # so a smaller K than the on-base era keeps the spread in standard ELO territory
 # (regulars ~1320-1900, elite ~1800) and keeps expected_woba reasonably calibrated.
@@ -269,15 +273,21 @@ def build_leaderboard(
         team = (player_teams or {}).get(pid, "")
         if team_filter and team not in team_filter:
             continue
+        pa = int(pa_counts.get(pid, 0))
+        avg = avg_ratings.get(pid, round(rating, 1))
+        # Value = rate above replacement × volume (WAR-shaped). Credits durability:
+        # a workhorse at a modest rate can outrank an elite, low-volume reliever.
+        value = round((avg - REPLACEMENT_ELO) * pa / 100)
         row = {
             "Name": display_names.get(pid, f"ID:{pid}"),
             "Team": team,
             "End ELO": round(rating, 1),
-            "Avg ELO": avg_ratings.get(pid, round(rating, 1)),
+            "Avg ELO": avg,
             "Peak ELO": round(peak_ratings.get(pid, rating), 1),
             "Worst ELO": round(worst_ratings.get(pid, rating), 1),
             "Range": round(peak_ratings.get(pid, rating) - worst_ratings.get(pid, rating), 1),
-            "PA": int(pa_counts.get(pid, 0)),
+            "PA": pa,
+            "Value": value,
         }
         for col_name, col_vals in extra_columns.items():
             row[col_name] = col_vals.get(pid)
