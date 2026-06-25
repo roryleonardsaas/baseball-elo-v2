@@ -6,11 +6,10 @@ from collections import defaultdict
 import pandas as pd
 
 DEFAULT_RATING = 1500.0
-# Value = (AvgELO − replacement) × PA / VALUE_SCALE — rate above replacement × volume,
-# on a clean ~0–10 (WAR-like) scale. The replacement level is exposed to the user as an
-# "innings weight" slider: lower replacement → volume outweighs rate.
+# Replacement-level floor for "ELO Value": a volume-adjusted rating on the ELO scale.
+# ELO Value = REPLACEMENT_ELO + (ELO − REPLACEMENT_ELO) × min(PA / full_workload, 1),
+# so a full-workload player keeps their ELO and a part-timer is scaled toward this floor.
 REPLACEMENT_ELO = 1360.0
-VALUE_SCALE = 25000.0
 # Tuned for wOBA residuals. wOBA outcomes are leptokurtic (rare +1.5 HR jumps),
 # so a smaller K than the on-base era keeps the spread in standard ELO territory
 # (regulars ~1320-1900, elite ~1800) and keeps expected_woba reasonably calibrated.
@@ -265,7 +264,6 @@ def build_leaderboard(
     team_filter: set | None = None,
     player_teams: dict[int, str] | None = None,
     extra_columns: dict[str, dict[int, float]] | None = None,
-    replacement: float = REPLACEMENT_ELO,
 ) -> pd.DataFrame:
     extra_columns = extra_columns or {}
     rows = []
@@ -275,22 +273,15 @@ def build_leaderboard(
         team = (player_teams or {}).get(pid, "")
         if team_filter and team not in team_filter:
             continue
-        pa = int(pa_counts.get(pid, 0))
-        avg = avg_ratings.get(pid, round(rating, 1))
-        # Value = rate above replacement × volume (WAR-shaped, ~0–10). Credits
-        # durability: a workhorse at a modest rate can outrank an elite, low-volume
-        # reliever. Lower replacement → volume matters more.
-        value = round((avg - replacement) * pa / VALUE_SCALE, 1)
         row = {
             "Name": display_names.get(pid, f"ID:{pid}"),
             "Team": team,
             "End ELO": round(rating, 1),
-            "Avg ELO": avg,
+            "Avg ELO": avg_ratings.get(pid, round(rating, 1)),
             "Peak ELO": round(peak_ratings.get(pid, rating), 1),
             "Worst ELO": round(worst_ratings.get(pid, rating), 1),
             "Range": round(peak_ratings.get(pid, rating) - worst_ratings.get(pid, rating), 1),
-            "PA": pa,
-            "Value": value,
+            "PA": int(pa_counts.get(pid, 0)),
         }
         for col_name, col_vals in extra_columns.items():
             row[col_name] = col_vals.get(pid)

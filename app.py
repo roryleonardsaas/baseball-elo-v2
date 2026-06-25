@@ -7,7 +7,17 @@ import plotly.graph_objects as go
 from collections import Counter
 
 from data_fetch import fetch_seasons
-from elo import run_elo, build_leaderboard, expected_woba, compute_park_factors, elo_index
+from elo import run_elo, build_leaderboard, expected_woba, compute_park_factors, elo_index, REPLACEMENT_ELO
+
+
+def _value(elo: float, pa_num: float, full_volume: float) -> float:
+    """ELO Value: ELO scaled toward the replacement floor by how much volume is in yet."""
+    return REPLACEMENT_ELO + (elo - REPLACEMENT_ELO) * min(pa_num / full_volume, 1.0)
+
+
+def value_history(hist: list, full_volume: float) -> list:
+    """Transform a per-PA ELO history into an ELO-Value history (rating at index 2)."""
+    return [(t[0], t[1], round(_value(t[2], t[0], full_volume), 1)) + tuple(t[3:]) for t in hist]
 
 st.set_page_config(page_title="Baseball ELO", layout="wide")
 st.title("Baseball ELO Ratings — Iteration 2: wOBA + Park Factors")
@@ -123,6 +133,33 @@ def available_cached_years() -> list[int]:
 
 
 @st.cache_data(show_spinner=False)
+def elo_value_metrics(years: tuple[int, ...], full_volume: int):
+    """
+    Per-player ELO-Value End/Avg/Peak/Worst, derived from the per-PA ELO history
+    (value accumulates as volume comes in). Returns (batter_dicts, pitcher_dicts)
+    where each is (end, avg, peak, worst).
+    """
+    df_y, _ = cached_fetch(years)
+    lw = round(float(df_y["woba_value"].mean()), 4)
+    res = cached_elo(years, lw)
+    b_hist, p_hist = res[8], res[9]
+    warmup = 50
+
+    def metrics(hist):
+        end, avg, peak, worst = {}, {}, {}, {}
+        for pid, h in hist.items():
+            vals = [_value(t[2], t[0], full_volume) for t in h]
+            end[pid] = round(vals[-1], 1)
+            peak[pid] = round(max(vals), 1)
+            worst[pid] = round(min(vals), 1)
+            post = [v for t, v in zip(h, vals) if t[0] > warmup]
+            avg[pid] = round(sum(post) / len(post), 1) if post else round(vals[-1], 1)
+        return end, avg, peak, worst
+
+    return metrics(b_hist), metrics(p_hist)
+
+
+@st.cache_data(show_spinner=False)
 def season_bundle(year: int):
     """Single-season ratings + names + league wOBA for the matchup predictor."""
     df_y, names_y = cached_fetch((year,))
@@ -185,15 +222,22 @@ with st.sidebar:
         scope_label = f"{start_year}–{end_year} career"
         st.caption("Uncached seasons download ~a few min each on first use.")
 
-    min_pa = st.slider("Min PA for leaderboard", 10, 1000, 100, 10)
-    sort_by = st.radio("Sort leaderboard by", ["Value", "End ELO", "Avg ELO", "Peak ELO", "Worst ELO", "Range"],
-                       help="Value: rate × playing time (credits innings/PA — a workhorse beats an elite low-volume arm). End ELO: current rating. Avg ELO: sustained rate. Peak/Worst: hottest/lowest point. Range: streakiness.")
-    innings_weight = st.slider(
-        "How much to reward innings / durability", 0, 100, 50, 5,
-        help="Higher = volume (innings/PA) counts more in Value; lower = pure rate matters more.",
+    metric_mode = st.radio(
+        "Rating", ["ELO", "ELO Value"], horizontal=True,
+        help="ELO: pure per-PA skill (rate). ELO Value: ELO scaled by playing time, so "
+             "a full-workload player keeps their ELO and a part-timer is dragged toward "
+             "replacement. Everything below — leaderboard, graph, avg/peak/worst — follows it.",
     )
-    # Map 0–100 to a replacement level: more innings weight → lower replacement.
-    replacement = 1420 - (innings_weight / 100) * (1420 - 1300)
+    full_volume = st.slider(
+        "PAs (batters) / batters faced (pitchers) for full credit", 100, 800, 500, 25,
+        help="In ELO Value, a player needs this much volume to be rated at their full ELO; "
+             "less volume scales the rating toward replacement. Higher = innings matter more.",
+        disabled=(metric_mode == "ELO"),
+    )
+
+    min_pa = st.slider("Min PA for leaderboard", 10, 1000, 100, 10)
+    sort_by = st.radio("Sort leaderboard by", ["End ELO", "Avg ELO", "Peak ELO", "Worst ELO", "Range"],
+                       help="End: current rating. Peak/Worst: hottest/lowest point. Avg: sustained value. Range: Peak minus Worst (streakiness). In ELO Value mode these columns show ELO Value.")
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 _src = ("Retrosheet" if all(y < 2015 for y in selected_years)
@@ -262,20 +306,31 @@ _opp["opp_for_pitcher"] = _opp["batter"].map(bat_strength)
 batter_opp_elo = _opp.groupby("batter")["opp_for_batter"].mean().round(0).to_dict()
 pitcher_opp_elo = _opp.groupby("pitcher")["opp_for_pitcher"].mean().round(0).to_dict()
 
+# In ELO Value mode, swap the End/Avg/Peak/Worst dicts for their volume-adjusted versions.
+if metric_mode == "ELO Value":
+    (b_end, b_avg, b_peak, b_worst), (p_end, p_avg, p_peak, p_worst) = elo_value_metrics(
+        selected_years, full_volume)
+else:
+    b_end, b_avg, b_peak, b_worst = batter_ratings, batter_avg, batter_peak, batter_worst
+    p_end, p_avg, p_peak, p_worst = pitcher_ratings, pitcher_avg, pitcher_peak, pitcher_worst
+
 leaderboard = build_leaderboard(
-    batter_ratings, batter_avg, batter_peak, batter_worst, display_names, batter_pa,
+    b_end, b_avg, b_peak, b_worst, display_names, batter_pa,
     min_pa, sort_by, team_filter, batter_teams,
     extra_columns={"ELO+": batter_eloplus, "wOBA+": batter_wobaplus, "Opp ELO": batter_opp_elo},
-    replacement=replacement,
 )
 pitcher_board = build_leaderboard(
-    pitcher_ratings, pitcher_avg, pitcher_peak, pitcher_worst, display_names, pitcher_pa,
+    p_end, p_avg, p_peak, p_worst, display_names, pitcher_pa,
     min_pa, sort_by, team_filter, pitcher_teams,
     extra_columns={"ELO−": pitcher_elominus, "wOBA-agst−": pitcher_wobaminus, "Opp ELO": pitcher_opp_elo},
-    replacement=replacement,
 )
 
 # ── Leaderboards ──────────────────────────────────────────────────────────────
+if metric_mode == "ELO Value":
+    st.info(f"**ELO Value mode** — the End/Avg/Peak/Worst columns show volume-adjusted ELO "
+            f"(full credit at {full_volume} PA/BF; less volume scales toward {REPLACEMENT_ELO:.0f}). "
+            f"Switch the sidebar Rating toggle back to **ELO** for pure rate.")
+
 st.subheader("Batters")
 st.caption("ELO+ = model talent index (from Avg ELO). wOBA+ = actual park-adjusted "
            "seasonal wOBA, indexed to 100 (≈ wRC+). Both: 100 = average, higher = better.")
@@ -582,7 +637,7 @@ fig.update_layout(barmode="overlay", xaxis_title="ELO Rating",
 st.plotly_chart(fig, use_container_width=True)
 
 # ── Player rating over time ───────────────────────────────────────────────────
-st.subheader("ELO Rating Over Time")
+st.subheader(f"{'ELO Value' if metric_mode == 'ELO Value' else 'ELO'} Rating Over Time")
 
 # Display name → player id for the loaded scope (drives the time-series picker).
 # With a Team Filter active, show every player on that team regardless of PA.
@@ -604,7 +659,7 @@ batter_label_to_id = _picker(batter_ratings, batter_pa, batter_teams)
 pitcher_label_to_id = _picker(pitcher_ratings, pitcher_pa, pitcher_teams)
 
 def build_compressed_chart(histories: dict[str, list], role_label: str,
-                           names: dict[int, str]) -> go.Figure:
+                           names: dict[int, str], rating_name: str = "ELO") -> go.Figure:
     """
     Date-based x-axis with off-days compressed.
     Active days (any selected player has a PA) get 1 unit each.
@@ -676,7 +731,7 @@ def build_compressed_chart(histories: dict[str, list], role_label: str,
             if last_rating is not None and last_x != base_x:
                 xs.append(base_x)
                 ys.append(last_rating)
-                hovers.append(f"{date.strftime('%b %d')} | game start | ELO: {last_rating}")
+                hovers.append(f"{date.strftime('%b %d')} | game start | {rating_name}: {last_rating}")
 
             for i, (pa_num, rating, event, opponent_id, delta, opp_elo) in enumerate(pas):
                 pa_x = base_x + (i / (n - 1) * 0.8 if n > 1 else 0.0)
@@ -688,7 +743,7 @@ def build_compressed_chart(histories: dict[str, list], role_label: str,
                     f"{date.strftime('%b %d')} | {role_label} #{pa_num}<br>"
                     f"{opp_label}: {opponent} (ELO {opp_elo})<br>"
                     f"Result: {result}<br>"
-                    f"ELO: {rating} ({sign}{delta})"
+                    f"{rating_name}: {rating} ({sign}{delta})"
                 )
                 xs.append(pa_x)
                 ys.append(rating)
@@ -702,32 +757,38 @@ def build_compressed_chart(histories: dict[str, list], role_label: str,
         ))
 
     fig.update_xaxes(tickvals=tickvals, ticktext=ticktext, tickangle=-45)
-    fig.update_layout(yaxis_title="ELO Rating", xaxis_title="Date (off-days compressed)")
+    fig.update_layout(yaxis_title=f"{rating_name} Rating", xaxis_title="Date (off-days compressed)")
     return fig
 
 
 tab_b, tab_p = st.tabs(["Batters", "Pitchers"])
 
+value_mode = metric_mode == "ELO Value"
+rating_name = "ELO Value" if value_mode else "ELO"
+
+def _maybe_value(hist):
+    return value_history(hist, full_volume) if value_mode else hist
+
 with tab_b:
     options = sorted(batter_label_to_id)
     selected = st.multiselect("Select batters", options, default=[])
     histories_b = {
-        label: batter_history[batter_label_to_id[label]]
+        label: _maybe_value(batter_history[batter_label_to_id[label]])
         for label in selected
         if batter_label_to_id[label] in batter_history
     }
-    st.plotly_chart(build_compressed_chart(histories_b, "PA", names),
+    st.plotly_chart(build_compressed_chart(histories_b, "PA", names, rating_name),
                     use_container_width=True, key="batter_timeline")
 
 with tab_p:
     options = sorted(pitcher_label_to_id)
     selected = st.multiselect("Select pitchers", options, default=[])
     histories_p = {
-        label: pitcher_history[pitcher_label_to_id[label]]
+        label: _maybe_value(pitcher_history[pitcher_label_to_id[label]])
         for label in selected
         if pitcher_label_to_id[label] in pitcher_history
     }
-    st.plotly_chart(build_compressed_chart(histories_p, "BF", names),
+    st.plotly_chart(build_compressed_chart(histories_p, "BF", names, rating_name),
                     use_container_width=True, key="pitcher_timeline")
 
 # ── Park factors ──────────────────────────────────────────────────────────────
